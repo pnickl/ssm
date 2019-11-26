@@ -3,10 +3,12 @@ from warnings import warn
 import autograd.numpy as np
 import autograd.numpy.random as npr
 from autograd.scipy.special import logsumexp
+from autograd.scipy.linalg import solve_triangular
 from autograd import grad
 
 from scipy.optimize import linear_sum_assignment, minimize
 from scipy.special import gammaln, digamma, polygamma
+
 
 from ssm.primitives import solve_symm_block_tridiag
 
@@ -295,3 +297,71 @@ def backtracking_line_search(x0, dx, obj, g, stepsize = 1.0, min_stepsize=1e-8,
             break
 
     return stepsize
+
+
+def flatten_to_dim(X, d):
+    """
+    Flatten an array of dimension k + d into an array of dimension 1 + d.
+
+    Example:
+        X = npr.rand(10, 5, 2, 2)
+        flatten_to_dim(X, 4).shape # (10, 5, 2, 2)
+        flatten_to_dim(X, 3).shape # (10, 5, 2, 2)
+        flatten_to_dim(X, 2).shape # (50, 2, 2)
+        flatten_to_dim(X, 1).shape # (100, 2)
+
+    Parameters
+    ----------
+    X : array_like
+        The array to be flattened.  Must be at least d dimensional
+
+    d : int (> 0)
+        The number of dimensions to retain.  All leading dimensions are flattened.
+
+    Returns
+    -------
+    flat_X : array_like
+        The input X flattened into an array dimension d (if X.ndim == d)
+        or d+1 (if X.ndim > d)
+    """
+    assert X.ndim >= d
+    assert d > 0
+    return np.reshape(X[None, ...], (-1,) + X.shape[-d:])
+
+
+def batch_mahalanobis(L, x):
+    """
+    Compute the squared Mahalanobis distance.
+    :math:`x^T M^{-1} x` for a factored :math:`M = LL^T`.
+
+    Copied from PyTorch torch.distributions.multivariate_normal.
+
+    Parameters
+    ----------
+    L : array_like (..., D, D)
+        Cholesky factorization(s) of covariance matrix
+
+    x : array_like (..., D)
+        Points at which to evaluate the quadratic term
+
+    Returns
+    -------
+    y : array_like (...,)
+        squared Mahalanobis distance :math:`x^T (LL^T)^{-1} x`
+
+        x^T (LL^T)^{-1} x = x^T L^{-T} L^{-1} x
+    """
+    # The most common shapes are x: (T, D) and L : (D, D)
+    # Special case that one
+    if x.ndim == 2 and L.ndim == 2:
+        xs = solve_triangular(L, x.T, lower=True)
+        return np.sum(xs**2, axis=0)
+
+    # Flatten the Cholesky into a (-1, D, D) array
+    flat_L = flatten_to_dim(L, 2)
+    # Invert each of the K arrays and reshape like L
+    L_inv = np.reshape(np.array([np.linalg.inv(Li.T) for Li in flat_L]), L.shape)
+    # dot with L_inv^T; square and sum.
+    xs = np.einsum('...i,...ij->...j', x, L_inv)
+    return np.sum(xs**2, axis=-1)
+

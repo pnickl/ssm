@@ -14,7 +14,7 @@ D = 2       # number of observed dimensions
 
 # Make an HMM with the true parameters
 true_hsmm = ssm.HSMM(K, D, observations="gaussian")
-true_hsmm.transitions.rs
+true_hsmm.transition_distn.rs
 z, y = true_hsmm.sample(T)
 z_test, y_test = true_hsmm.sample(T)
 true_ll = true_hsmm.log_probability(y)
@@ -24,11 +24,11 @@ N_em_iters = 100
 
 print("Fitting Gaussian HSMM with EM")
 hsmm = ssm.HSMM(K, D, observations="gaussian")
-hsmm_em_lls = hsmm.fit(y, method="em", num_em_iters=N_em_iters)
+hsmm_em_lls, hsmm_posterior = hsmm.fit(y, method="em", num_em_iters=N_em_iters)
 
 print("Fitting Gaussian HMM with EM")
 hmm = ssm.HMM(K, D, observations="gaussian")
-hmm_em_lls = hmm.fit(y, method="em", num_em_iters=N_em_iters)
+hmm_em_lls, hmm_posterior = hmm.fit(y, method="em", num_em_iters=N_em_iters)
 
 # Plot log likelihoods (fit model is typically better)
 plt.figure()
@@ -44,10 +44,10 @@ print("Fit HSMM:  ", hsmm.log_likelihood(y_test))
 print("Fit HMM: ", hmm.log_likelihood(y_test))
 
 # Plot the true and inferred states
-hsmm.permute(find_permutation(z, hsmm.most_likely_states(y)))
-hsmm_z = hsmm.most_likely_states(y)
-hmm.permute(find_permutation(z, hmm.most_likely_states(y)))
-hmm_z = hsmm.most_likely_states(y)
+hsmm.permute(find_permutation(z, hsmm_posterior.mode))
+hsmm_z = hsmm_posterior.mode
+hmm.permute(find_permutation(z, hmm_posterior.mode))
+hmm_z = hmm_posterior.mode
 
 
 # Plot the true and inferred discrete states
@@ -85,7 +85,7 @@ for k in range(K):
     # Plot the durations of the true states
     plt.subplot(3, K, k+1)
     plt.hist(durations[states == k] - 1, dd, density=True)
-    plt.plot(dd, nbinom.pmf(dd, true_hsmm.transitions.rs[k], 1 - true_hsmm.transitions.ps[k]),
+    plt.plot(dd, nbinom.pmf(dd, true_hsmm.transition_distn.rs[k], 1 - true_hsmm.transition_distn.ps[k]),
              '-k', lw=2, label='true')
     if k == K - 1:
         plt.legend(loc="lower right")
@@ -94,7 +94,7 @@ for k in range(K):
     # Plot the durations of the inferred states
     plt.subplot(3, K, K+k+1)
     plt.hist(inf_durations[inf_states == k] - 1, dd, density=True)
-    plt.plot(dd, nbinom.pmf(dd, hsmm.transitions.rs[k], 1 - hsmm.transitions.ps[k]),
+    plt.plot(dd, nbinom.pmf(dd, hsmm.transition_distn.rs[k], 1 - hsmm.transition_distn.ps[k]),
              '-r', lw=2, label='hsmm inf.')
     if k == K - 1:
         plt.legend(loc="lower right")
@@ -103,7 +103,7 @@ for k in range(K):
         # Plot the durations of the inferred states
     plt.subplot(3, K, 2*K+k+1)
     plt.hist(hmm_inf_durations[hmm_inf_states == k] - 1, dd, density=True)
-    plt.plot(dd, nbinom.pmf(dd, 1, 1 - hmm.transitions.transition_matrix[k, k]),
+    plt.plot(dd, nbinom.pmf(dd, 1, 1 - hmm.transition_distn.transition_matrix[k, k]),
              '-r', lw=2, label='hmm inf.')
     if k == K - 1:
         plt.legend(loc="lower right")

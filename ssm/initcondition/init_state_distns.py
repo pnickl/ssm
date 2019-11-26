@@ -26,10 +26,12 @@ class InitialStateDistribution(object):
     def pi0(self):
         return np.exp(self.log_pi0 - logsumexp(self.log_pi0))
 
-
     @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None):
         pass
+
+    def sample(self, data, covariate, tag, with_noise=True):
+        return npr.choice(self.K, p=self.pi0)
 
     def permute(self, perm):
         """
@@ -44,5 +46,5 @@ class InitialStateDistribution(object):
         return 0
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        pi0 = sum([Ez[0] for Ez, _, _ in expectations]) + 1e-8
+        pi0 = sum([e["Ez"][0] for e in expectations]) + 1e-8
         self.log_pi0 = np.log(pi0 / pi0.sum())

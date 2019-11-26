@@ -8,12 +8,12 @@ from autograd.scipy.stats import dirichlet
 from autograd import hessian
 
 from ssm.util import one_hot, logistic, relu, rle, ensure_args_are_lists
-from ssm.regression import fit_multiclass_logistic_regression, fit_negative_binomial_integer_r
+from ssm.regression import fit_multiclass_logistic_regression, fit_negative_binomial_integer_r, fit_linear_regression_given_expectations
 from ssm.stats import multivariate_normal_logpdf
 from ssm.optimizers import adam, bfgs, lbfgs, rmsprop, sgd
 
 
-class Transitions(object):
+class HMMTransitions(object):
     def __init__(self, K, D, M=0):
         self.K, self.D, self.M = K, D, M
 
@@ -25,21 +25,21 @@ class Transitions(object):
     def params(self, value):
         raise NotImplementedError
 
-    @ensure_args_are_lists
-    def initialize(self, datas, inputs=None, masks=None, tags=None):
-        pass
-
     def permute(self, perm):
         pass
-
-    def log_prior(self):
-        return 0
 
     def log_transition_matrices(self, data, input, mask, tag):
         raise NotImplementedError
 
     def transition_matrices(self, data, input, mask, tag):
         return np.exp(self.log_transition_matrices(data, input, mask, tag))
+
+    def sample(self, states, data, input, tag, with_noise=True):
+        P = self.transition_matrices(data, input, None, tag)[-1]
+        if with_noise:
+            return npr.choice(self.K, p=P[states[-1]])
+        else:
+            return np.argmax(P[states[-1]])
 
     def m_step(self, expectations, datas, inputs, masks, tags,
                optimizer="lbfgs", num_iters=100, **kwargs):
@@ -51,10 +51,10 @@ class Transitions(object):
         # Maximize the expected log joint
         def _expected_log_joint(expectations):
             elbo = self.log_prior()
-            for data, input, mask, tag, (expected_states, expected_joints, _) \
+            for data, input, mask, tag, e \
                 in zip(datas, inputs, masks, tags, expectations):
                 log_Ps = self.log_transition_matrices(data, input, mask, tag)
-                elbo += np.sum(expected_joints * log_Ps)
+                elbo += np.sum(e["Ezzp1"] * log_Ps)
             return elbo
 
         # Normalize and negate for minimization
@@ -81,7 +81,8 @@ class Transitions(object):
         terms = np.array([hess(x[None,:], Ezzp1) for x, Ezzp1 in zip(data, expected_joints)])
         return terms
 
-class StationaryTransitions(Transitions):
+
+class StationaryTransitions(HMMTransitions):
     """
     Standard Hidden Markov Model with fixed initial distribution and transition matrix.
     """
@@ -110,13 +111,13 @@ class StationaryTransitions(Transitions):
         return np.exp(self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True))
 
     def log_transition_matrices(self, data, input, mask, tag):
-        T = data.shape[0]
+        T = len(data)
         log_Ps = self.log_Ps - logsumexp(self.log_Ps, axis=1, keepdims=True)
         # return np.tile(log_Ps[None, :, :], (T-1, 1, 1))
         return log_Ps[None, :, :]
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        P = sum([np.sum(Ezzp1, axis=0) for _, Ezzp1, _ in expectations]) + 1e-16
+        P = sum([np.sum(e["Ezzp1"], axis=0) for e in expectations]) + 1e-16
         P /= P.sum(axis=-1, keepdims=True)
         self.log_Ps = np.log(P)
 
@@ -124,6 +125,7 @@ class StationaryTransitions(Transitions):
         # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
         T, D = data.shape
         return np.zeros((T-1, D, D))
+
 
 class StickyTransitions(StationaryTransitions):
     """
@@ -147,7 +149,7 @@ class StickyTransitions(StationaryTransitions):
         return lp
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        expected_joints = sum([np.sum(Ezzp1, axis=0) for _, Ezzp1, _ in expectations]) + 1e-8
+        expected_joints = sum([np.sum(e["Ezzp1"], axis=0) for e in expectations]) + 1e-8
         expected_joints += self.kappa * np.eye(self.K)
         P = expected_joints / expected_joints.sum(axis=1, keepdims=True)
         self.log_Ps = np.log(P)
@@ -156,6 +158,7 @@ class StickyTransitions(StationaryTransitions):
         # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
         T, D = data.shape
         return np.zeros((T-1, D, D))
+
 
 class InputDrivenTransitions(StickyTransitions):
     """
@@ -208,6 +211,7 @@ class InputDrivenTransitions(StickyTransitions):
         # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
         T, D = data.shape
         return np.zeros((T-1, D, D))
+
 
 class RecurrentTransitions(InputDrivenTransitions):
     """
@@ -262,7 +266,8 @@ class RecurrentTransitions(InputDrivenTransitions):
                     + np.einsum('ti, tj -> tij', Rv, Rv))
         return hess
 
-class RecurrentOnlyTransitions(Transitions):
+
+class RecurrentOnlyTransitions(HMMTransitions):
     """
     Only allow the past observations and inputs to influence the
     next state.  Get rid of the transition matrix and replace it
@@ -301,7 +306,7 @@ class RecurrentOnlyTransitions(Transitions):
         return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True)       # normalize
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        Transitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
+        HMMTransitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
 
     def hessian_expected_log_trans_prob(self, data, input, mask, tag, expected_joints):
         # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
@@ -312,6 +317,7 @@ class RecurrentOnlyTransitions(Transitions):
         Rv = vtilde@self.Rs
         return np.einsum('tn, ni, nj ->tij', -vtilde, self.Rs, self.Rs) \
                + np.einsum('ti, tj -> tij', Rv, Rv)
+
 
 class RBFRecurrentTransitions(InputDrivenTransitions):
     """
@@ -392,11 +398,11 @@ class RBFRecurrentTransitions(InputDrivenTransitions):
         return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True)
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        Transitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
+        HMMTransitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
 
 
 # Allow general nonlinear emission models with neural networks
-class NeuralNetworkRecurrentTransitions(Transitions):
+class NeuralNetworkRecurrentTransitions(HMMTransitions):
     def __init__(self, K, D, M=0, hidden_layer_sizes=(50,), nonlinearity="relu"):
         super(NeuralNetworkRecurrentTransitions, self).__init__(K, D, M=M)
 
@@ -444,173 +450,5 @@ class NeuralNetworkRecurrentTransitions(Transitions):
 
     def m_step(self, expectations, datas, inputs, masks, tags, optimizer="adam", num_iters=100, **kwargs):
         # Default to adam instead of bfgs for the neural network model.
-        Transitions.m_step(self, expectations, datas, inputs, masks, tags,
+        HMMTransitions.m_step(self, expectations, datas, inputs, masks, tags,
             optimizer=optimizer, num_iters=num_iters, **kwargs)
-
-
-class NegativeBinomialSemiMarkovTransitions(Transitions):
-    """
-    Semi-Markov transition model with negative binomial (NB) distributed
-    state durations, as compared to the geometric state durations in the
-    standard Markov model.  The negative binomial has higher variance than
-    the geometric, but its mode can be greater than 1.
-
-    The NB(r, p) distribution, with r a positive integer and p a probability
-    in [0, 1], is this distribution over number of heads before seeing
-    r tails where the probability of heads is p. The number of heads
-    between each tails is an independent geometric random variable.  Thus,
-    the total number of heads is the sum of r independent and identically
-    distributed geometric random variables.
-
-    We can "embed" the semi-Markov model with negative binomial durations
-    in the standard Markov model by expanding the state space.  Map each
-    discrete state k to r new states: (k,1), (k,2), ..., (k,r_k),
-    for k in 1, ..., K. The total number of states is \sum_k r_k,
-    where state k has a NB(r_k, p_k) duration distribution.
-
-    The transition probabilities are as follows. The probability of staying
-    within the same "super state" are:
-
-    p(z_{t+1} = (k,i) | z_t = (k,i)) = p_k
-
-    and for 0 <= j <= r_k - i
-
-    p(z_{t+1} = (k,i+j) | z_t = (k,i)) = (1-p_k)^{j-i} p_k
-
-    The probability of flipping (r_k - i + 1) tails in a row in state k;
-    i.e. the probability of exiting super state k, is (1-p_k)^{r_k-i+1}.
-    Thus, the probability of transitioning to a new super state is:
-
-    p(z_{t+1} = (j,1) | z_t = (k,i)) = (1-p_k)^{r_k-i+1} * P[k, j]
-
-    where P[k, j] is a transition matrix with zero diagonal.
-
-    As a sanity check, note that the sum of probabilities is indeed 1:
-
-    \sum_{j=i}^{r_k} p(z_{t+1} = (k,j) | z_t = (k,i))
-        + \sum_{m \neq k}  p(z_{t+1} = (m, 1) | z_t = (k, i))
-
-    = \sum_{j=0}^{r_k-i} (1-p_k)^j p_k + \sum_{m \neq k} (1-p_k)^{r_k-i+1} * P[k, j]
-
-    = p_k (1-(1-p_k)^{r_k-i+1}) / (1-(1-p_k)) + (1-p_k)^{r_k-i+1}
-
-    = 1 - (1-p_k)^{r_k-i+1} + (1 - p_k)^{r_k-i+1}
-
-    = 1.
-
-    where we used the geometric series and the fact that \sum_{j != k} P[k, j] = 1.
-    """
-    def __init__(self, K, D, M=0, r_min=1, r_max=20):
-        assert K > 1, "Explicit duration models only work if num states > 1."
-        super(NegativeBinomialSemiMarkovTransitions, self).__init__(K, D, M=M)
-
-        # Initialize the super state transition probabilities
-        self.Ps = npr.rand(K, K)
-        np.fill_diagonal(self.Ps, 0)
-        self.Ps /= self.Ps.sum(axis=1, keepdims=True)
-
-        # Initialize the negative binomial duration probabilities
-        self.r_min, self.r_max = r_min, r_max
-        self.rs = npr.randint(r_min, r_max + 1, size=K)
-        # self.rs = np.ones(K, dtype=int)
-        # self.ps = npr.rand(K)
-        self.ps = 0.5 * np.ones(K)
-
-        # Initialize the transition matrix
-        self._transition_matrix = None
-
-    @property
-    def params(self):
-        return (self.Ps, self.rs, self.ps)
-
-    @params.setter
-    def params(self, value):
-        Ps, rs, ps = value
-        assert Ps.shape == (self.K, self.K)
-        assert np.allclose(np.diag(Ps), 0)
-        assert np.allclose(Ps.sum(1), 1)
-        assert rs.shape == (self.K)
-        assert rs.dtype == int
-        assert np.all(rs > 0)
-        assert ps.shape == (self.K)
-        assert np.all(ps > 0)
-        assert np.all(ps < 1)
-        self.Ps, self.rs, self.ps = Ps, rs, ps
-
-        # Reset the transition matrix
-        self._transition_matrix = None
-
-    def permute(self, perm):
-        """
-        Permute the discrete latent states.
-        """
-        self.Ps = self.Ps[np.ix_(perm, perm)]
-        self.rs = self.rs[perm]
-        self.ps = self.ps[perm]
-
-        # Reset the transition matrix
-        self._transition_matrix = None
-
-    @property
-    def total_num_states(self):
-        return np.sum(self.rs)
-
-    @property
-    def state_map(self):
-        return np.repeat(np.arange(self.K), self.rs)
-
-    @property
-    def transition_matrix(self):
-        if self._transition_matrix is not None:
-            return self._transition_matrix
-
-        As, rs, ps = self.Ps, self.rs, self.ps
-
-        # Fill in the transition matrix one block at a time
-        K_total = self.total_num_states
-        P = np.zeros((K_total, K_total))
-        starts = np.concatenate(([0], np.cumsum(rs)[:-1]))
-        ends = np.cumsum(rs)
-        for (i, j), Aij in np.ndenumerate(As):
-            block = P[starts[i]:ends[i], starts[j]:ends[j]]
-
-            # Diagonal blocks (stay in sub-state or advance to next sub-state)
-            if i == j:
-                for k in range(rs[i]):
-                    # p(z_{t+1} = (.,i+k) | z_t = (.,i)) = (1-p)^k p
-                    # for 0 <= k <= r - i
-                    block += (1 - ps[i])**k * ps[i] * np.diag(np.ones(rs[i]-k), k=k)
-
-            # Off-diagonal blocks (exit to a new super state)
-            else:
-                # p(z_{t+1} = (j,1) | z_t = (k,i)) = (1-p_k)^{r_k-i+1} * A[k, j]
-                block[:,0] = (1-ps[i]) ** np.arange(rs[i], 0, -1) * Aij
-
-        assert np.allclose(P.sum(1),1)
-        assert (0 <= P).all() and (P <= 1.).all()
-
-        # Cache the transition matrix
-        self._transition_matrix = P
-
-        return P
-
-    def log_transition_matrices(self, data, input, mask, tag):
-        T = data.shape[0]
-        P = self.transition_matrix
-        return np.tile(np.log(P)[None, :, :], (T-1, 1, 1))
-
-    def m_step(self, expectations, datas, inputs, masks, tags, samples, **kwargs):
-        # Update the transition matrix between super states
-        P = sum([np.sum(Ezzp1, axis=0) for _, Ezzp1, _ in expectations]) + 1e-16
-        np.fill_diagonal(P, 0)
-        P /= P.sum(axis=-1, keepdims=True)
-        self.Ps = P
-
-        # Fit negative binomial models for each duration based on sampled states
-        states, durations = map(np.concatenate, zip(*[rle(z_smpl) for z_smpl in samples]))
-        for k in range(self.K):
-            self.rs[k], self.ps[k] = \
-                fit_negative_binomial_integer_r(durations[states == k], self.r_min, self.r_max)
-
-        # Reset the transition matrix
-        self._transition_matrix = None

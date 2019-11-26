@@ -1,7 +1,6 @@
 # Define an autograd extension for HMM normalizer
 import autograd.numpy as np
 import autograd.numpy.random as npr
-from autograd.scipy.special import logsumexp
 from autograd.scipy.linalg import cholesky_banded, solve_banded, solveh_banded
 from autograd.extend import primitive, defvjp
 from autograd.tracer import getval
@@ -12,54 +11,8 @@ from ssm.cstats import _blocks_to_bands_lower, _blocks_to_bands_upper, \
                        _transpose_banded, vjp_cholesky_banded_lower, \
                        _vjp_solve_banded_A, _vjp_solveh_banded_A
 
-from ssm.messages import forward_pass, grad_hmm_normalizer
 
 to_c = lambda arr: np.copy(getval(arr), 'C') if not arr.flags['C_CONTIGUOUS'] else getval(arr)
-
-@primitive
-def hmm_normalizer(pi0, Ps, ll):
-    T, K = ll.shape
-    alphas = np.zeros((T, K))
-
-    # Make sure everything is C contiguous
-    pi0 = to_c(pi0)
-    Ps = to_c(Ps)
-    ll = to_c(ll)
-
-    forward_pass(pi0, Ps, ll, alphas)
-    return logsumexp(alphas[-1])
-
-
-def _make_grad_hmm_normalizer(argnum, ans, pi0, Ps, ll):
-    # Make sure everything is C contiguous and unboxed
-    pi0 = to_c(pi0)
-    Ps = to_c(Ps)
-    ll = to_c(ll)
-
-    dlog_pi0 = np.zeros_like(pi0)
-    dlog_Ps= np.zeros_like(Ps)
-    dll = np.zeros_like(ll)
-    T, K = ll.shape
-
-    # Forward pass to get alphas
-    alphas = np.zeros((T, K))
-    forward_pass(pi0, Ps, ll, alphas)
-    grad_hmm_normalizer(np.log(Ps), alphas, dlog_pi0, dlog_Ps, dll)
-
-    # Compute necessary gradient
-    # Account for the log transformation
-    # df/dP = df/dlogP * dlogP/dP = df/dlogP * 1 / P
-    if argnum == 0:
-        return lambda g: g * dlog_pi0 / pi0
-    if argnum == 1:
-        return lambda g: g * dlog_Ps / Ps
-    if argnum == 2:
-        return lambda g: g * dll
-
-defvjp(hmm_normalizer,
-       partial(_make_grad_hmm_normalizer, 0),
-       partial(_make_grad_hmm_normalizer, 1),
-       partial(_make_grad_hmm_normalizer, 2))
 
 """
 Block tridiagonal system operations:

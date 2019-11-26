@@ -219,11 +219,11 @@ def backward_sample(Ps, log_likes, alphas, us, zs):
 
         # set the transition potential
         if t > 0:
-            lpzp1 = np.log(Ps[(t-1) * hetero, :, zs[t]])
+            lpzp1 = np.log(Ps[(t-1) * hetero, :, int(zs[t])])
 
 
 @numba.jit(nopython=True, cache=True)
-def hmm_sample(pi0, Ps, ll):
+def _hmm_sample(pi0, Ps, ll):
     T, K = ll.shape
 
     # Forward pass gets the predicted state at time t given
@@ -233,9 +233,13 @@ def hmm_sample(pi0, Ps, ll):
 
     # Sample backward
     us = npr.rand(T)
-    zs = -1 * np.ones(T, dtype=int)
+    zs = -1 * np.ones(T)
     backward_sample(Ps, ll, alphas, us, zs)
     return zs
+
+
+def hmm_sample(pi0, Ps, ll):
+    return _hmm_sample(pi0, Ps, ll).astype(int)
 
 
 @numba.jit(nopython=True, cache=True)
@@ -541,7 +545,8 @@ def _kalman_smoother(mu0, S0, As, Bs, Qs, Cs, Ds, Rs, us, ys):
     # Initialize outputs, noise, and temporary variables
     smoothed_mus = np.zeros((T, D))
     smoothed_Sigmas = np.zeros((T, D, D))
-    smoothed_CrossSigmas = np.zeros((T-1, D, D))
+    # smoothed_CrossSigmas = np.zeros((T-1, D, D))
+    ExxnT = np.zeros((T-1, D, D))
     Gt = np.zeros((D, D))
 
     # The last time step is known from the Kalman filter
@@ -562,9 +567,10 @@ def _kalman_smoother(mu0, S0, As, Bs, Qs, Cs, Ds, Rs, us, ys):
         smoothed_mus[t] = filtered_mus[t] + Gt @ (smoothed_mus[t+1] - At @ filtered_mus[t] - Bt @ us[t])
         smoothed_Sigmas[t] = filtered_Sigmas[t] + \
                              Gt @ (smoothed_Sigmas[t+1] - At @ filtered_Sigmas[t] @ At.T - Qt) @ Gt.T
-        smoothed_CrossSigmas[t] = Gt @ smoothed_Sigmas[t+1]
+        # smoothed_CrossSigmas[t] = Gt @ smoothed_Sigmas[t+1]
+        ExxnT[t] = Gt @ smoothed_Sigmas[t+1] + np.outer(smoothed_mus[t], smoothed_mus[t+1])
 
-    return ll, smoothed_mus, smoothed_Sigmas, smoothed_CrossSigmas
+    return ll, smoothed_mus, smoothed_Sigmas, ExxnT
 
 
 def kalman_wrapper(f):
@@ -817,7 +823,7 @@ def _kalman_info_smoother(J_ini, h_ini, log_Z_ini,
     smoothed_hs = np.zeros((T, D))
     smoothed_mus = np.zeros((T, D))
     smoothed_Sigmas = np.zeros((T, D, D))
-    smoothed_CrossSigmas = np.zeros((T-1, D, D))
+    ExxnT = np.zeros((T-1, D, D))
 
     # Initialize
     smoothed_Js[-1] = filtered_Js[-1]
@@ -861,9 +867,10 @@ def _kalman_info_smoother(J_ini, h_ini, log_Z_ini,
         #
         # We want to solve for S_b. From the block inversion formula we have
         #   S_b = -J_a^{-1} J_b S_c
-        smoothed_CrossSigmas[t] = -np.linalg.solve(filtered_Js[t] + J_11, np.dot(J_21.T, smoothed_Sigmas[t+1]))
+        ExxnT[t] = -np.linalg.solve(filtered_Js[t] + J_11, np.dot(J_21.T, smoothed_Sigmas[t+1]))
+        ExxnT[t] += np.outer(smoothed_mus[t], smoothed_mus[t+1])
 
-    return log_Z, smoothed_mus, smoothed_Sigmas, smoothed_CrossSigmas
+    return log_Z, smoothed_mus, smoothed_Sigmas, ExxnT
 
 
 def kalman_info_wrapper(f):
@@ -907,7 +914,7 @@ def kalman_info_wrapper(f):
     """
     def wrapper(J_ini, h_ini, log_Z_ini,
                 J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
-                J_obs, h_obs, log_Z_obs):
+                J_obs, h_obs, log_Z_obs, **kwargs):
 
         T, D = h_obs.shape
         # Check shapes
@@ -934,7 +941,7 @@ def kalman_info_wrapper(f):
 
         return f(J_ini, h_ini, log_Z_ini,
                  J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
-                 J_obs, h_obs, log_Z_obs)
+                 J_obs, h_obs, log_Z_obs, **kwargs)
 
 
     return wrapper
@@ -968,12 +975,15 @@ def kalman_info_filter_with_predictions(
 def kalman_info_sample(
     J_ini, h_ini, log_Z_ini,
     J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
-    J_obs, h_obs, log_Z_obs):
+    J_obs, h_obs, log_Z_obs,
+    num_samples=1):
 
-    return _kalman_info_sample(
+    samples = _kalman_info_sample(
         J_ini, h_ini, log_Z_ini,
         J_dyn_11, J_dyn_21, J_dyn_22, h_dyn_1, h_dyn_2, log_Z_dyn,
         J_obs, h_obs, log_Z_obs)
+
+    return samples[:, :, 0] if num_samples == 1 else samples
 
 
 @kalman_info_wrapper
@@ -1074,13 +1084,11 @@ def test_lds(T=1000, D=2, N=10, U=3):
     # Test the standard Kalman smoother
     from pylds.lds_messages_interface import E_step as kalman_smoother_ref
     ll1, smoothed_mus1, smoothed_Sigmas1, ExnxT1 = kalman_smoother_ref(*args)
-    ll2, smoothed_mus2, smoothed_Sigmas2, smoothed_CrossSigmas2 = kalman_smoother(*args)
-    ExxnT2 = smoothed_CrossSigmas2 + smoothed_mus2[:-1][:, :, None] * smoothed_mus2[1:, None, :]
-    ExnxT2 = np.swapaxes(ExxnT2, 1, 2)
+    ll2, smoothed_mus2, smoothed_Sigmas2, ExxnT2 = kalman_smoother(*args)
     assert np.allclose(ll1, ll2)
     assert np.allclose(smoothed_mus1, smoothed_mus2)
     assert np.allclose(smoothed_Sigmas1, smoothed_Sigmas2)
-    assert np.allclose(ExnxT1, ExnxT2)
+    assert np.allclose(ExnxT1, np.swapaxes(ExxnT2, 1, 2))
 
     # Test the info form filter
     info_args = convert_mean_to_info_args(*args)
@@ -1092,10 +1100,10 @@ def test_lds(T=1000, D=2, N=10, U=3):
     assert np.allclose(filtered_hs1, filtered_hs2)
 
     # Test the info form smoother
-    _, smoothed_mus3, smoothed_Sigmas3, smoothed_CrossSigmas3 = kalman_info_smoother(*info_args)
+    _, smoothed_mus3, smoothed_Sigmas3, ExxnT3 = kalman_info_smoother(*info_args)
     assert np.allclose(smoothed_mus1, smoothed_mus3)
     assert np.allclose(smoothed_Sigmas1, smoothed_Sigmas3)
-    assert np.allclose(smoothed_CrossSigmas2, smoothed_CrossSigmas3)
+    assert np.allclose(ExxnT2, ExxnT3)
 
     xs = kalman_info_sample(*info_args)
 

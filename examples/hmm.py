@@ -50,7 +50,7 @@ for obs in observations:
         smoothed_y = full_posterior.denoise()
 
         # Permute to match the true states
-        model.permute(find_permutation(z, full_posterior.mode))
+        model.permute(find_permutation(z, full_posterior.mode, K, K))
         results[(obs, method)] = (model, train_lls, smoothed_z, smoothed_y)
 
 # Plot the inferred states

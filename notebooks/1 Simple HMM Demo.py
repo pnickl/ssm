@@ -8,7 +8,7 @@
 
 import autograd.numpy as np
 import autograd.numpy.random as npr
-npr.seed(0)
+npr.seed(1234)
 
 import matplotlib.pyplot as plt
 get_ipython().run_line_magic('matplotlib', 'inline')
@@ -50,7 +50,7 @@ true_hmm = ssm.HMM(K, D, observations="gaussian")
 
 # Manually tweak the means to make them farther apart
 thetas = np.linspace(0, 2 * np.pi, K, endpoint=False)
-true_hmm.observations.mus = 3 * np.column_stack((np.cos(thetas), np.sin(thetas)))
+true_hmm.observation_distn.mus = 3 * np.column_stack((np.cos(thetas), np.sin(thetas)))
 
 
 # In[3]:
@@ -71,7 +71,7 @@ data = np.column_stack((XX.ravel(), YY.ravel()))
 input = np.zeros((data.shape[0], 0))
 mask = np.ones_like(data, dtype=bool)
 tag = None
-lls = true_hmm.observations.log_likelihoods(data, input, mask, tag)
+lls = true_hmm.observation_distn.log_likelihoods(data, input, mask, tag)
 
 
 # In[5]:
@@ -99,7 +99,7 @@ lim = 1.05 * abs(y).max()
 plt.figure(figsize=(8, 6))
 plt.imshow(z[None,:], aspect="auto", cmap=cmap, vmin=0, vmax=len(colors)-1, extent=(0, T, -lim, (D)*lim))
 
-Ey = true_hmm.observations.mus[z]
+Ey = true_hmm.observation_distn.mus[z]
 for d in range(D):
     plt.plot(y[:,d] + lim * d, '-k')
     plt.plot(Ey[:,d] + lim * d, ':k')
@@ -176,4 +176,10 @@ plt.xlim(0, T)
 plt.ylabel("$y$")
 # plt.yticks([])
 plt.xlabel("time")
+
+
+# In[ ]:
+
+
+
 

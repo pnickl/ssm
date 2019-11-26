@@ -9,20 +9,338 @@ from ssm.optimizers import adam_step, rmsprop_step, sgd_step, convex_combination
 from ssm.util import ensure_args_are_lists, ensure_args_not_none, \
     ensure_slds_args_not_none, ensure_variational_args_are_lists, \
     replicate, collapse
-from ssm.posterior import HMMExactPosterior
 
 import ssm.observations as obs
 import ssm.transitions as trans
 import ssm.init_state_distns as isd
 import ssm.hierarchical as hier
 import ssm.emissions as emssn
+import ssm.posterior as post
 
 __all__ = ['HMM', 'HSMM']
 
 
-class HMM(object):
+class _SSM(object):
     """
-    Base class for hidden Markov models.
+    Abstract base class for temporal state space models (SSMs).
+
+    SSMs specify a joint distribution over latent states and observed data.
+    The observations are typically assumed to be conditionally independent
+    of one another given their underlying latent states. The latent states,
+    in turn, are linked by temporal dependencies.  Finally, the latent states
+    may also have an initial distribution for the first time step.
+
+    This base class implements generic fitting code for state space models.
+    It supports:
+
+    1.  Stochastic gradient ascent of the marginal likelihood, as long
+        as it is possible to obtain an estimate of or lower bound on that
+        quantity.
+
+    2.  (Generalized) expectation maximization, which alternates
+        between updating an (approximate) posterior distribution and then
+        updating global parameters to maximize the expected log probability
+        under that posterior.  The family of generalized EM algorithms includes
+        variational EM, Monte Carlo EM, particle EM, and so on.
+
+    3.  Gibbs sampling, which alternates between sampling the latent states
+        and sampling the model parameters from their respective conditional
+        distributions.
+    """
+
+    # Specify the set of available (approximate) posterior distributions
+    _posterior_classes = {}
+
+    @property
+    def initial_state_distn(self):
+        raise NotImplementedError
+
+    @property
+    def transition_distn(self):
+        raise NotImplementedError
+
+    @property
+    def observation_distn(self):
+        raise NotImplementedError
+
+    @ensure_args_are_lists
+    def initialize(self, datas, inputs=None, masks=None, tags=None):
+        """
+        Initialize parameters given data.
+        """
+        pass
+
+    def sample(self, num_timesteps,
+               inputs=None,
+               preceding_states=None,
+               preceding_data=None,
+               preceding_inputs=None,
+               tag=None,
+               with_noise=True):
+        """
+        Sample synthetic data from the model. Optionally, condition on a given
+        prefix (preceding discrete states and data).
+
+        Parameters
+        ----------
+        num_timesteps : int
+            number of time steps to sample
+
+        inputs : iterable of length num_timesteps
+
+        preceding_states : interable
+            Optional set of preceding latente states.  Must match the type of
+            the output states.
+
+        preceding_data : interable of same length as preceding_states
+            Optional set of preceding observed data.  Must match the type of
+            the output states.
+
+        preceding_inputs : interable of same length as preceding_states
+            Optional set of preceding observed data.  Must match the type of
+            the output states.
+
+        Returns
+        -------
+        states : list
+            Sequence of sampled discrete states
+
+        data : list
+            Array of sampled data
+        """
+        covariates, states, data = [], [], []
+
+        # Make dummy inputs if necessary
+        inputs = [None] * num_timesteps if inputs is None else inputs
+
+        # Initialize the states and data
+        has_preceding = None not in [preceding_states, preceding_data]
+        if has_preceding:
+            assert len(preceding_data) == len(preceding_states)
+            preceding_inputs = [None] * len(preceding_states) if preceding_inputs is None else preceding_inputs
+            assert len(preceding_inputs) == len(preceding_states)
+
+            covariates.extend(preceding_inputs)
+            states.extend(preceding_states)
+            data.extend(preceding_data)
+
+            # Sample the first state given the preceding states and data
+            covariates.append(inputs[0])
+            states.append(self.transition_distn.sample(states, data, covariates, tag, with_noise=with_noise))
+
+        else:
+            # Sample the initial state from its initial distribution
+            covariates.append(inputs[0])
+            states.append(self.initial_state_distn.sample(data, covariates, tag, with_noise=with_noise))
+
+        # Sample the first data point, then fill in the rest of the data
+        data.append(self.observation_distn.sample(states, data, covariates, tag, with_noise=with_noise))
+        for t in range(1, num_timesteps):
+            covariates.append(inputs[t])
+            states.append(self.transition_distn.sample(states, data, covariates, tag, with_noise=with_noise))
+            data.append(self.observation_distn.sample(states, data, covariates, tag, with_noise=with_noise))
+
+        # Return the sampled data
+        return states[-num_timesteps:], data[-num_timesteps:]
+
+    def log_prior(self):
+        """
+        Compute the log prior probability of the model parameters
+        """
+        return self.initial_state_distn.log_prior() + \
+               self.transition_distn.log_prior() + \
+               self.observation_distn.log_prior()
+
+    @ensure_args_are_lists
+    def log_likelihood(self, datas, inputs=None, masks=None, tags=None, posterior="exact"):
+        """
+        Compute the log probability of the data under the current
+        model parameters.
+
+        :param datas: single array or list of arrays of data.
+        :return total log probability of the data.
+        """
+        ll = 0
+        for data, input, mask, tag in zip(datas, inputs, masks, tags):
+            p = self._posterior_classes[posterior](self, data, input, mask, tag)
+            ll += p.marginal_likelihood
+            assert np.isfinite(ll)
+        return ll
+
+    @ensure_args_are_lists
+    def log_probability(self, datas, inputs=None, masks=None, tags=None):
+        return self.log_likelihood(datas, inputs, masks, tags) + self.log_prior()
+
+    # Model fitting
+    def _fit_sgd(self, optimizer, posteriors, datas, inputs, masks, tags, num_iters=1000, **kwargs):
+        """
+        Fit the model with maximum marginal likelihood.
+        """
+        T = sum([data.shape[0] for data in datas])
+        def _objective(params, itr):
+            self.initial_state_distn.params = params[0]
+            self.transition_distn.params = params[1]
+            self.observation_distn.params = params[2]
+
+            obj = self.log_prior()
+            for posterior in posteriors:
+                obj += posterior.marginal_likelihood
+            return -obj / T
+
+        # Set up the progress bar
+        params = (self.initial_state_distn.params,
+                  self.transition_distn.params,
+                  self.observation_distn.params)
+        lls = [-_objective(params, 0) * T]
+        pbar = trange(num_iters)
+        pbar.set_description("Epoch {} Itr {} LP: {:.1f}".format(0, 0, lls[-1]))
+
+        # Run the optimizer
+        step = dict(sgd=sgd_step, rmsprop=rmsprop_step, adam=adam_step)[optimizer]
+        state = None
+        for itr in pbar:
+            params, val, g, state = step(value_and_grad(_objective), params, itr, state, **kwargs)
+            self.initial_state_distn.params = params[0]
+            self.transition_distn.params = params[1]
+            self.observation_distn.params = params[2]
+
+            lls.append(-val * T)
+            pbar.set_description("LP: {:.1f}".format(lls[-1]))
+            pbar.update(1)
+
+        return lls
+
+    def _fit_em(self, posteriors, datas, inputs, masks, tags,
+                num_em_iters=100, tolerance=0,
+                init_state_mstep_kwargs={},
+                transitions_mstep_kwargs={},
+                observations_mstep_kwargs={}):
+        """
+        Fit the parameters with expectation maximization.
+
+        E step: compute E[z_t] and E[z_t, z_{t+1}] with message passing;
+        M-step: analytical maximization of E_{p(z | x)} [log p(x, z; theta)].
+        """
+        # Run one E step to start
+        expectations, lls = list(zip(*[posterior.E_step() for posterior in posteriors]))
+        logprobs = [self.log_prior() + sum(lls)]
+
+        pbar = trange(num_em_iters)
+        pbar.set_description("LP: {:.1f}".format(lls[-1]))
+        for itr in pbar:
+            # M step: maximize expected log joint wrt parameters
+            self.initial_state_distn.m_step(expectations, datas, inputs, masks, tags, **init_state_mstep_kwargs)
+            self.transition_distn.m_step(expectations, datas, inputs, masks, tags, **transitions_mstep_kwargs)
+            self.observation_distn.m_step(expectations, datas, inputs, masks, tags, **observations_mstep_kwargs)
+
+            # E step: compute expected latent states under the posterior
+            expectations, lls = list(zip(*[posterior.E_step() for posterior in posteriors]))
+            logprobs.append(self.log_prior() + sum(lls))
+
+            # Show progress
+            pbar.set_description("LP: {:.1f}".format(logprobs[-1]))
+
+            # Check for convergence
+            if itr > 0 and abs(logprobs[-1] - logprobs[-2]) < tolerance:
+                pbar.set_description("Converged to LP: {:.1f}".format(logprobs[-1]))
+                break
+
+        return logprobs
+
+    def _fit_gibbs(self, posteriors, datas, inputs, masks, tags,
+                num_em_iters=100, tolerance=0,
+                init_state_mstep_kwargs={},
+                transitions_mstep_kwargs={},
+                observations_mstep_kwargs={}):
+
+        # Initialize the posteriors with a draw from their conditional
+        states = [posterior.sample() for posterior in posteriors]
+        lls = [self.log_prior() + sum(p.log_joint for p in posteriors)]
+
+        pbar = trange(num_em_iters)
+        pbar.set_description("LP: {:.1f}".format(lls[-1]))
+        for itr in pbar:
+            # Update the parameters
+            self.initial_state_distn.gibbs_step(states, datas, inputs, masks, tags, **init_state_mstep_kwargs)
+            self.transition_distn.gibbs_step(states, datas, inputs, masks, tags, **transitions_mstep_kwargs)
+            self.observation_distn.gibbs_step(states, datas, inputs, masks, tags, **observations_mstep_kwargs)
+
+            # Update the latent states
+            states = [posterior.sample() for posterior in posteriors]
+            lls.append(self.log_prior() + sum(p.log_joint for p in posteriors))
+
+            # Print progress
+            pbar.set_description("LP: {:.1f}".format(lls[-1]))
+
+            # Check for convergence
+            if itr > 0 and abs(lls[-1] - lls[-2]) < tolerance:
+                pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
+                break
+
+        return lls
+
+    @ensure_args_are_lists
+    def fit(self, datas, inputs=None, masks=None, tags=None,
+            method="em", posterior="exact", initialize=True, **kwargs):
+        _fitting_methods = \
+            dict(sgd=partial(self._fit_sgd, "sgd"),
+                 adam=partial(self._fit_sgd, "adam"),
+                 em=self._fit_em,
+                 gibbs=self._fit_gibbs
+                 )
+
+        # Initialize the parameters
+        if initialize:
+            self.initialize(datas, inputs=inputs, masks=masks, tags=tags)
+
+        # Construct the posterior objects
+        if posterior not in self._posterior_classes:
+            raise Exception("Invalid posterior: {}. Options are {}".
+                            format(posterior, self._posterior_classes.keys()))
+
+        posteriors = [self._posterior_classes[posterior](self, data, input, mask, tag)
+                      for data, input, mask, tag in
+                      zip(datas, inputs, masks, tags)]
+
+        # Run the appropriate fitting method
+        if method not in _fitting_methods:
+            raise Exception("Invalid method: {}. Options are {}".
+                            format(method, _fitting_methods.keys()))
+
+        lls = _fitting_methods[method](posteriors, datas, inputs=inputs, masks=masks, tags=tags, **kwargs)
+
+        # Return training likelihoods and posterior(s)
+        if len(posteriors) == 1:
+            return lls, posteriors[0]
+        else:
+            return lls, posteriors
+
+
+    @ensure_args_are_lists
+    def infer(self, datas, inputs=None, masks=None, tags=None, posterior="exact", **kwargs):
+        """
+        Infer the posterior distribution over data given fixed model parameters.
+        """
+        # Construct the posterior objects
+        if posterior not in self._posterior_classes:
+            raise Exception("Invalid posterior: {}. Options are {}".
+                            format(posterior, self._posterior_classes.keys()))
+
+        posteriors = []
+        for data, input, mask, tag in zip(datas, inputs, masks, tags):
+            p = self._posterior_classes[posterior](self, data, input, mask, tag)
+            posteriors.append(p)
+
+        # Return posterior(s)
+        if len(posteriors) == 1:
+            return posteriors[0]
+        else:
+            return posteriors
+
+
+class HMM(_SSM):
+    """
+    A Hidden Markov Model.
 
     Notation:
     K: number of discrete latent states
@@ -32,6 +350,8 @@ class HMM(object):
     In the code we will sometimes refer to the discrete
     latent state sequence as z and the data as x.
     """
+    _posterior_classes = dict(exact=post.HMMExactPosterior)
+
     def __init__(self, K, D, M=0, init_state_distn=None,
                  transitions='standard',
                  transition_kwargs=None,
@@ -118,280 +438,85 @@ class HMM(object):
                             " ssm.observations.Observations")
 
         self.K, self.D, self.M = K, D, M
-        self.init_state_distn = init_state_distn
-        self.transitions = transitions
-        self.observations = observations
+        self._init_state_distn = init_state_distn
+        self._transition_distn = transitions
+        self._observation_distn = observations
+
+    @property
+    def initial_state_distn(self):
+        return self._init_state_distn
+
+    @property
+    def transition_distn(self):
+        return self._transition_distn
+
+    @property
+    def observation_distn(self):
+        return self._observation_distn
 
     # TODO: Expose properties for common model attributes of the model
-
-    @ensure_args_are_lists
-    def initialize(self, datas, inputs=None, masks=None, tags=None):
-        """
-        Initialize parameters given data.
-        """
-        self.init_state_distn.initialize(datas, inputs=inputs, masks=masks, tags=tags)
-        self.transitions.initialize(datas, inputs=inputs, masks=masks, tags=tags)
-        self.observations.initialize(datas, inputs=inputs, masks=masks, tags=tags)
 
     def permute(self, perm):
         """
         Permute the discrete latent states.
         """
         assert np.all(np.sort(perm) == np.arange(self.K))
-        self.init_state_distn.permute(perm)
-        self.transitions.permute(perm)
-        self.observations.permute(perm)
+        self.initial_state_distn.permute(perm)
+        self.transition_distn.permute(perm)
+        self.observation_distn.permute(perm)
 
-    def sample(self, T, prefix=None, input=None, tag=None, with_noise=True):
+    def sample(self, num_timesteps,
+               inputs=None,
+               preceding_states=None,
+               preceding_data=None,
+               preceding_inputs=None,
+               tag=None,
+               with_noise=True):
         """
         Sample synthetic data from the model. Optionally, condition on a given
         prefix (preceding discrete states and data).
 
         Parameters
         ----------
-        T : int
+        num_timesteps : int
             number of time steps to sample
 
-        prefix : (zpre, xpre)
-            Optional prefix of discrete states (zpre) and continuous states (xpre)
-            zpre must be an array of integers taking values 0...num_states-1.
-            xpre must be an array of the same length that has preceding observations.
+        inputs : iterable of length num_timesteps
 
-        input : (T, input_dim) array_like
-            Optional inputs to specify for sampling
+        preceding_states : interable
+            Optional set of preceding latente states.  Must match the type of
+            the output states.
 
-        tag : object
-            Optional tag indicating which "type" of sampled data
+        preceding_data : interable of same length as preceding_states
+            Optional set of preceding observed data.  Must match the type of
+            the output states.
 
-        with_noise : bool
-            Whether or not to sample data with noise.
+        preceding_inputs : interable of same length as preceding_states
+            Optional set of preceding observed data.  Must match the type of
+            the output states.
 
         Returns
         -------
-        z_sample : array_like of type int
+        states : array_like of dtype int
             Sequence of sampled discrete states
 
-        x_sample : (T x observation_dim) array_like
+        data : array_like
             Array of sampled data
         """
-        K = self.K
-        D = (self.D,) if isinstance(self.D, int) else self.D
-        M = (self.M,) if isinstance(self.M, int) else self.M
-        assert isinstance(D, tuple)
-        assert isinstance(M, tuple)
-        assert T > 0
+        states, data = \
+            super(HMM, self).sample(num_timesteps,
+                                    inputs=inputs,
+                                    preceding_states=preceding_states,
+                                    preceding_data=preceding_data,
+                                    preceding_inputs=preceding_inputs,
+                                    tag=tag,
+                                    with_noise=with_noise)
 
-        # Check the inputs
-        if input is not None:
-            assert input.shape == (T,) + M
-
-        # Get the type of the observations
-        dummy_data = self.observations.sample_x(0, np.empty(0,) + D)
-        dtype = dummy_data.dtype
-
-        # Initialize the data array
-        if prefix is None:
-            # No prefix is given.  Sample the initial state as the prefix.
-            pad = 1
-            z = np.zeros(T, dtype=int)
-            data = np.zeros((T,) + D, dtype=dtype)
-            input = np.zeros((T,) + M) if input is None else input
-            mask = np.ones((T,) + D, dtype=bool)
-
-            # Sample the first state from the initial distribution
-            pi0 = self.init_state_distn.initial_state_distn(data, input, mask, tag)
-            z[0] = npr.choice(self.K, p=pi0)
-            data[0] = self.observations.sample_x(z[0], data[:0], input=input[0], with_noise=with_noise)
-
-            # We only need to sample T-1 datapoints now
-            T = T - 1
-
-        else:
-            # Check that the prefix is of the right type
-            zpre, xpre = prefix
-            pad = len(zpre)
-            assert zpre.dtype == int and zpre.min() >= 0 and zpre.max() < K
-            assert xpre.shape == (pad,) + D
-
-            # Construct the states, data, inputs, and mask arrays
-            z = np.concatenate((zpre, np.zeros(T, dtype=int)))
-            data = np.concatenate((xpre, np.zeros((T,) + D, dtype)))
-            input = np.zeros((T+pad,) + M) if input is None else np.concatenate((np.zeros((pad,) + M), input))
-            mask = np.ones((T+pad,) + D, dtype=bool)
-
-        # Fill in the rest of the data
-        for t in range(pad, pad+T):
-            Pt = self.transitions.transition_matrices(data[t-1:t+1], input[t-1:t+1], mask=mask[t-1:t+1], tag=tag)[0]
-            z[t] = npr.choice(self.K, p=Pt[z[t-1]])
-            data[t] = self.observations.sample_x(z[t], data[:t], input=input[t], tag=tag, with_noise=with_noise)
-
-        # Return the whole data if no prefix is given.
-        # Otherwise, just return the simulated part.
-        if prefix is None:
-            return z, data
-        else:
-            return z[pad:], data[pad:]
-
-    def log_prior(self):
-        """
-        Compute the log prior probability of the model parameters
-        """
-        return self.init_state_distn.log_prior() + \
-               self.transitions.log_prior() + \
-               self.observations.log_prior()
-
-    @ensure_args_are_lists
-    def log_likelihood(self, datas, inputs=None, masks=None, tags=None):
-        """
-        Compute the log probability of the data under the current
-        model parameters.
-
-        :param datas: single array or list of arrays of data.
-        :return total log probability of the data.
-        """
-        ll = 0
-        for data, input, mask, tag in zip(datas, inputs, masks, tags):
-            posterior = HMMExactPosterior(self, data, input, mask, tag)
-            ll += posterior.marginal_likelihood
-            assert np.isfinite(ll)
-        return ll
-
-    @ensure_args_are_lists
-    def log_probability(self, datas, inputs=None, masks=None, tags=None):
-        return self.log_likelihood(datas, inputs, masks, tags) + self.log_prior()
-
-    # Model fitting
-    def _fit_sgd(self, optimizer, posteriors, datas, inputs, masks, tags, num_iters=1000, **kwargs):
-        """
-        Fit the model with maximum marginal likelihood.
-        """
-        T = sum([data.shape[0] for data in datas])
-        def _objective(params, itr):
-            self.init_state_distn.params = params[0]
-            self.transitions.params = params[1]
-            self.observations.params = params[2]
-
-            obj = self.log_prior()
-            for posterior in posteriors:
-                obj += posterior.marginal_likelihood
-            return -obj / T
-
-        # Set up the progress bar
-        init_params = (self.init_state_distn.params, self.transitions.params, self.observations.params)
-        lls = [-_objective(init_params, 0) * T]
-        pbar = trange(num_iters)
-        pbar.set_description("Epoch {} Itr {} LP: {:.1f}".format(0, 0, lls[-1]))
-
-        # Run the optimizer
-        step = dict(sgd=sgd_step, rmsprop=rmsprop_step, adam=adam_step)[optimizer]
-        state = None
-        for itr in pbar:
-            init_params = (self.init_state_distn.params, self.transitions.params, self.observations.params)
-            params, val, g, state = step(value_and_grad(_objective), init_params, itr, state, **kwargs)
-            self.init_state_distn.params, self.transitions.params, self.observations.params = params
-
-            lls.append(-val * T)
-            pbar.set_description("LP: {:.1f}".format(lls[-1]))
-            pbar.update(1)
-
-        return lls
-
-    def _fit_em(self, posteriors, datas, inputs, masks, tags,
-                num_em_iters=100, tolerance=0,
-                init_state_mstep_kwargs={},
-                transitions_mstep_kwargs={},
-                observations_mstep_kwargs={}):
-        """
-        Fit the parameters with expectation maximization.
-
-        E step: compute E[z_t] and E[z_t, z_{t+1}] with message passing;
-        M-step: analytical maximization of E_{p(z | x)} [log p(x, z; theta)].
-        """
-        # Run one E step to start
-        expectations = [posterior.expectations for posterior in posteriors]
-        lls = [self.log_prior() + sum(ll for _, _, ll in expectations)]
-
-        pbar = trange(num_em_iters)
-        pbar.set_description("LP: {:.1f}".format(lls[-1]))
-        for itr in pbar:
-            # M step: maximize expected log joint wrt parameters
-            self.init_state_distn.m_step(expectations, datas, inputs, masks, tags, **init_state_mstep_kwargs)
-            self.transitions.m_step(expectations, datas, inputs, masks, tags, **transitions_mstep_kwargs)
-            self.observations.m_step(expectations, datas, inputs, masks, tags, **observations_mstep_kwargs)
-
-            # E step: compute expected latent states under the posterior
-            expectations = [posterior.expectations for posterior in posteriors]
-            lls.append(self.log_prior() + sum(ll for _, _, ll in expectations))
-
-            # Store progress
-            pbar.set_description("LP: {:.1f}".format(lls[-1]))
-
-            # Check for convergence
-            if itr > 0 and abs(lls[-1] - lls[-2]) < tolerance:
-                pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
-                break
-
-        return lls
-
-    @ensure_args_are_lists
-    def fit(self, datas, inputs=None, masks=None, tags=None,
-            method="em", posterior="exact", initialize=True, **kwargs):
-        _fitting_methods = \
-            dict(sgd=partial(self._fit_sgd, "sgd"),
-                 adam=partial(self._fit_sgd, "adam"),
-                 em=self._fit_em,
-                 )
-
-        # Initialize the parameters
-        if initialize:
-            self.initialize(datas, inputs=inputs, masks=masks, tags=tags)
-
-        # Construct the posterior objects
-        _posterior_classes = \
-            dict(exact=HMMExactPosterior)
-
-        if posterior not in _posterior_classes:
-            raise Exception("Invalid posterior: {}. Options are {}".
-                            format(posterior, _posterior_classes.keys()))
-
-        posteriors = [_posterior_classes[posterior](self, data, input, mask, tag)
-                      for data, input, mask, tag in
-                      zip(datas, inputs, masks, tags)]
-
-        # Run the appropriate fitting method
-        if method not in _fitting_methods:
-            raise Exception("Invalid method: {}. Options are {}".
-                            format(method, _fitting_methods.keys()))
-
-        lls = _fitting_methods[method](posteriors, datas, inputs=inputs, masks=masks, tags=tags, **kwargs)
-
-        if len(posteriors) == 1:
-            return lls, posteriors[0]
-        else:
-            return lls, posteriors
+        states = np.array(states, dtype=int)
+        data = np.array(data)
+        return states, data
 
 
-    @ensure_args_are_lists
-    def infer(self, datas, inputs=None, masks=None, tags=None, posterior="exact", **kwargs):
-        """
-        Infer the posterior distribution over data given fixed model parameters.
-        """
-        # Construct the posterior objects
-        _posterior_classes = \
-            dict(exact=HMMExactPosterior)
-
-        if posterior not in _posterior_classes:
-            raise Exception("Invalid posterior: {}. Options are {}".
-                            format(posterior, _posterior_classes.keys()))
-
-        posteriors = [_posterior_classes[posterior](self, data, input, mask, tag)
-                for data, input, mask, tag in
-                zip(datas, inputs, masks, tags)]
-
-        if len(posteriors) == 1:
-            return posteriors[0]
-        else:
-            return posteriors
 
 class HSMM(HMM):
     """
@@ -402,8 +527,9 @@ class HSMM(HMM):
     super+sub states ((1,1), ..., (1,r_1), ..., (K,1), ..., (K,r_K)).
     Here, r_k denotes the number of sub-states of state k.
     """
+    _posterior_classes = dict(exact=post.HSMMExactPosterior)
 
-    def __init__(self, K, D, *, M=0, init_state_distn=None,
+    def __init__(self, K, D, M=0, init_state_distn=None,
                  transitions="nb", transition_kwargs=None,
                  observations="gaussian", observation_kwargs=None,
                  **kwargs):
@@ -465,234 +591,80 @@ class HSMM(HMM):
             raise TypeError("'observations' must be a subclass of"
                             " ssm.observations.Observations")
 
-        super().__init__(K, D, M=M, transitions=transitions,
-                        transition_kwargs=transition_kwargs,
-                        observations=observations,
-                        observation_kwargs=observation_kwargs,
-                        **kwargs)
+        self.K, self.D, self.M = K, D, M
+        self._init_state_distn = init_state_distn
+        self._transition_distn = transitions
+        self._observation_distn = observations
+
+    @property
+    def initial_state_distn(self):
+        return self._init_state_distn
+
+    @property
+    def transition_distn(self):
+        return self._transition_distn
+
+    @property
+    def observation_distn(self):
+        return self._observation_distn
 
     @property
     def state_map(self):
-        return self.transitions.state_map
+        return self.transition_distn.state_map
 
-    def sample(self, T, prefix=None, input=None, tag=None, with_noise=True):
+    def sample(self, num_timesteps,
+               inputs=None,
+               preceding_states=None,
+               preceding_data=None,
+               preceding_inputs=None,
+               tag=None,
+               with_noise=True):
         """
         Sample synthetic data from the model. Optionally, condition on a given
         prefix (preceding discrete states and data).
 
         Parameters
         ----------
-        T : int
+        num_timesteps : int
             number of time steps to sample
 
-        prefix : (zpre, xpre)
-            Optional prefix of discrete states (zpre) and continuous states (xpre)
-            zpre must be an array of integers taking values 0...num_states-1.
-            xpre must be an array of the same length that has preceding observations.
+        inputs : iterable of length num_timesteps
 
-        input : (T, input_dim) array_like
-            Optional inputs to specify for sampling
+        preceding_states : interable
+            Optional set of preceding latente states.  Must match the type of
+            the output states.
 
-        tag : object
-            Optional tag indicating which "type" of sampled data
+        preceding_data : interable of same length as preceding_states
+            Optional set of preceding observed data.  Must match the type of
+            the output states.
 
-        with_noise : bool
-            Whether or not to sample data with noise.
+        preceding_inputs : interable of same length as preceding_states
+            Optional set of preceding observed data.  Must match the type of
+            the output states.
 
         Returns
         -------
-        z_sample : array_like of type int
+        states : array_like of dtype int
             Sequence of sampled discrete states
 
-        x_sample : (T x observation_dim) array_like
+        data : array_like
             Array of sampled data
         """
-        K = self.K
-        D = (self.D,) if isinstance(self.D, int) else self.D
-        M = (self.M,) if isinstance(self.M, int) else self.M
-        assert isinstance(D, tuple)
-        assert isinstance(M, tuple)
-        assert T > 0
+        states, data = \
+            super(HSMM, self).sample(num_timesteps,
+                                    inputs=inputs,
+                                    preceding_states=preceding_states,
+                                    preceding_data=preceding_data,
+                                    preceding_inputs=preceding_inputs,
+                                    tag=tag,
+                                    with_noise=with_noise)
 
-        # Check the inputs
-        if input is not None:
-            assert input.shape == (T,) + M
-
-        # Get the type of the observations
-        dummy_data = self.observations.sample_x(0, np.empty(0,) + D)
-        dtype = dummy_data.dtype
-
-        # Initialize the data array
-        if prefix is None:
-            # No prefix is given.  Sample the initial state as the prefix.
-            pad = 1
-            z = np.zeros(T, dtype=int)
-            data = np.zeros((T,) + D, dtype=dtype)
-            input = np.zeros((T,) + M) if input is None else input
-            mask = np.ones((T,) + D, dtype=bool)
-
-            # Sample the first state from the initial distribution
-            pi0 = np.exp(self.init_state_distn.log_initial_state_distn(data, input, mask, tag))
-            z[0] = npr.choice(self.K, p=pi0)
-            data[0] = self.observations.sample_x(z[0], data[:0], input=input[0], with_noise=with_noise)
-
-            # We only need to sample T-1 datapoints now
-            T = T - 1
-
-        else:
-            # Check that the prefix is of the right type
-            zpre, xpre = prefix
-            pad = len(zpre)
-            assert zpre.dtype == int and zpre.min() >= 0 and zpre.max() < K
-            assert xpre.shape == (pad,) + D
-
-            # Construct the states, data, inputs, and mask arrays
-            z = np.concatenate((zpre, np.zeros(T, dtype=int)))
-            data = np.concatenate((xpre, np.zeros((T,) + D, dtype)))
-            input = np.zeros((T+pad,) + M) if input is None else np.concatenate((np.zeros((pad,) + M), input))
-            mask = np.ones((T+pad,) + D, dtype=bool)
-
-        # Convert the discrete states to the range (1, ..., K_total)
-        m = self.state_map
-        K_total = len(m)
-        _, starts = np.unique(m, return_index=True)
-        z = starts[z]
-
-        # Fill in the rest of the data
-        for t in range(pad, pad+T):
-            Pt = self.transitions.transition_matrices(data[t-1:t+1], input[t-1:t+1], mask=mask[t-1:t+1], tag=tag)[0]
-            z[t] = npr.choice(K_total, p=Pt[z[t-1]])
-            data[t] = self.observations.sample_x(m[z[t]], data[:t], input=input[t], tag=tag, with_noise=with_noise)
+        states = np.array(states, dtype=int)
+        data = np.array(data)
 
         # Collapse the states
-        z = m[z]
+        states = self.state_map[states]
 
-        # Return the whole data if no prefix is given.
-        # Otherwise, just return the simulated part.
-        if prefix is None:
-            return z, data
-        else:
-            return z[pad:], data[pad:]
+        return states, data
 
-    @ensure_args_not_none
-    def expected_states(self, data, input=None, mask=None, tag=None):
-        m = self.state_map
-        pi0 = self.init_state_distn.initial_state_distn(data, input, mask, tag)
-        Ps = self.transitions.transition_matrices(data, input, mask, tag)
-        log_likes = self.observations.log_likelihoods(data, input, mask, tag)
-        Ez, Ezzp1, normalizer = hmm_expected_states(replicate(pi0, m), Ps, replicate(log_likes, m))
 
-        # Collapse the expected states
-        Ez = collapse(Ez, m)
-        Ezzp1 = collapse(collapse(Ezzp1, m, axis=2), m, axis=1)
-        return Ez, Ezzp1, normalizer
-
-    @ensure_args_not_none
-    def most_likely_states(self, data, input=None, mask=None, tag=None):
-        m = self.state_map
-        pi0 = self.init_state_distn.initial_state_distn(data, input, mask, tag)
-        Ps = self.transitions.transition_matrices(data, input, mask, tag)
-        log_likes = self.observations.log_likelihoods(data, input, mask, tag)
-        z_star = viterbi(replicate(pi0, m), Ps, replicate(log_likes, m))
-        return self.state_map[z_star]
-
-    @ensure_args_not_none
-    def filter(self, data, input=None, mask=None, tag=None):
-        m = self.state_map
-        pi0 = self.init_state_distn.initial_state_distn(data, input, mask, tag)
-        Ps = self.transitions.transition_matrices(data, input, mask, tag)
-        log_likes = self.observations.log_likelihoods(data, input, mask, tag)
-        pzp1 = hmm_filter(replicate(pi0, m), Ps, replicate(log_likes, m))
-        return collapse(pzp1, m)
-
-    @ensure_args_not_none
-    def posterior_sample(self, data, input=None, mask=None, tag=None):
-        m = self.state_map
-        pi0 = self.init_state_distn.initial_state_distn(data, input, mask, tag)
-        Ps = self.transitions.transition_matrices(data, input, mask, tag)
-        log_likes = self.observations.log_likelihoods(data, input, mask, tag)
-        z_smpl = hmm_sample(replicate(pi0, m), Ps, replicate(log_likes, m))
-        return self.state_map[z_smpl]
-
-    @ensure_args_not_none
-    def smooth(self, data, input=None, mask=None, tag=None):
-        """
-        Compute the mean observation under the posterior distribution
-        of latent discrete states.
-        """
-        m = self.state_map
-        Ez, _, _ = self.expected_states(data, input, mask)
-        return self.observations.smooth(Ez, data, input, tag)
-
-    @ensure_args_are_lists
-    def log_likelihood(self, datas, inputs=None, masks=None, tags=None):
-        """
-        Compute the log probability of the data under the current
-        model parameters.
-
-        :param datas: single array or list of arrays of data.
-        :return total log probability of the data.
-        """
-        m = self.state_map
-        ll = 0
-        for data, input, mask, tag in zip(datas, inputs, masks, tags):
-            pi0 = self.init_state_distn.initial_state_distn(data, input, mask, tag)
-            Ps = self.transitions.transition_matrices(data, input, mask, tag)
-            log_likes = self.observations.log_likelihoods(data, input, mask, tag)
-            ll += hmm_normalizer(replicate(pi0, m), Ps, replicate(log_likes, m))
-            assert np.isfinite(ll)
-        return ll
-
-    def expected_log_probability(self, expectations, datas, inputs=None, masks=None, tags=None):
-        """
-        Compute the log probability of the data under the current
-        model parameters.
-
-        :param datas: single array or list of arrays of data.
-        :return total log probability of the data.
-        """
-        raise NotImplementedError("Need to get raw expectations for the expected transition probability.")
-
-    def _fit_em(self, datas, inputs, masks, tags, num_em_iters=100, **kwargs):
-        """
-        Fit the parameters with expectation maximization.
-
-        E step: compute E[z_t] and E[z_t, z_{t+1}] with message passing;
-        M-step: analytical maximization of E_{p(z | x)} [log p(x, z; theta)].
-        """
-        lls = [self.log_probability(datas, inputs, masks, tags)]
-
-        pbar = trange(num_em_iters)
-        pbar.set_description("LP: {:.1f}".format(lls[-1]))
-        for itr in pbar:
-            # E step: compute expected latent states with current parameters
-            expectations = [self.expected_states(data, input, mask, tag)
-                            for data, input, mask, tag in zip(datas, inputs, masks, tags)]
-
-            # E step: also sample the posterior for stochastic M step of transition model
-            samples = [self.posterior_sample(data, input, mask, tag)
-                       for data, input, mask, tag in zip(datas, inputs, masks, tags)]
-
-            # M step: maximize expected log joint wrt parameters
-            self.init_state_distn.m_step(expectations, datas, inputs, masks, tags, **kwargs)
-            self.transitions.m_step(expectations, datas, inputs, masks, tags, samples, **kwargs)
-            self.observations.m_step(expectations, datas, inputs, masks, tags, **kwargs)
-
-            # Store progress
-            lls.append(self.log_prior() + sum([ll for (_, _, ll) in expectations]))
-            pbar.set_description("LP: {:.1f}".format(lls[-1]))
-
-        return lls
-
-    @ensure_args_are_lists
-    def fit(self, datas, inputs=None, masks=None, tags=None, method="em", initialize=True, **kwargs):
-        _fitting_methods = dict(em=self._fit_em)
-
-        if method not in _fitting_methods:
-            raise Exception("Invalid method: {}. Options are {}".\
-                            format(method, _fitting_methods.keys()))
-
-        if initialize:
-            self.initialize(datas, inputs=inputs, masks=masks, tags=tags)
-
-        return _fitting_methods[method](datas, inputs=inputs, masks=masks, tags=tags, **kwargs)

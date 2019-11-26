@@ -5,7 +5,7 @@ from autograd import elementwise_grad
 import autograd.numpy as np
 import autograd.numpy.random as npr
 from autograd.scipy.linalg import block_diag
-from autograd.scipy.special import logsumexp, polygamma, digamma
+from autograd.scipy.special import logsumexp, polygamma, digamma, gammaln
 from scipy.optimize import minimize
 from warnings import warn
 
@@ -110,6 +110,118 @@ def fit_linear_regression(Xs, ys,
         return W, b, Sigma
     else:
         return W, Sigma
+
+
+def fit_linear_regression_given_expectations(
+        Exs, Eys, ExxTs, ExyTs, EyyTs,
+        inputs=None,
+        fit_intercept=True,
+        weights=None,
+        ):
+    """
+    Perform an exact m-step in a linear Gaussian regression model given
+    expected sufficient statistics of inputs and outputs.
+
+    Model:  y ~ N(Ax + Bu + b, Q)
+
+    Output: (A, B, b, Q) that maximize E_{p(x,y)}[log p(y | x)]
+
+    Let x \in R^D and y \in R^N
+
+    Expectations:
+
+    Ex     = E[(x_1, ..., x_T)]                       a (T, D) array
+    Ey     = E[(y_1, ..., y_T)]                       a (T, N) array
+    ExxT   = E[(x_1 x_1^T, ..., x_T x_T^T)]           a (T, D, D) array
+    ExyT   = E[(x_1 y_1^T, ..., x_T y_T^T)]           a (T, D, N) array
+    EyyT   = E[(y_1 y_1^T, ..., y_T y_T^T)]           a (T, N, N) array
+
+    The solution is effectively the same as the least squares solution.
+        A* = (ExxT)^{-1} ExyT
+    We just have to be careful to handle the inputs and bias term appropriately.
+    The covariance Q is given by the covariance of the expected residuals.
+
+    Derivations:
+
+    The expected log joint probability is,
+
+    E[\sum_t log N(y_t | Ax_t + Bu_t + b, Q)]
+    = E[\sum_t log N(y_t | [A, B, b] @ [x_t, u_t, 1], Q)]
+    = E[\sum_t -1/2 || y_t - [A, B, b] @ [x_t, u_t, 1] ||_Q^2
+
+    Now change notation to A = [A, B, b] and x_t = [x_t, u_t, 1].
+    = E[\sum_t -1/2 || y_t - A @ x_t] ||_Q^2
+    = E[\sum_t -1/2 || Q^{-1/2} (y_t - A @ x_t)] ||_2^2
+
+    This is a standard least squares problem. The solution is,
+
+    Q^{-1/2} A = (\sum_t Q^{-1/2} E[y_t x_t^T]) (\sum_t E[x_t x_t^T])^{-1}
+    Q^{-1/2} A =  Q^{-1/2} (\sum_t E[y_t x_t^T]) (\sum_t E[x_t x_t^T])^{-1}
+             A = (\sum_t E[y_t x_t]^T) (\sum_t E[x_t x_t^T])^{-1}
+
+    Importantly, the covariance Q doesn't affect the solution of A.
+    Once we've solved for A, the optimal Q is the expected residual covariance.
+
+    The expected residual covariance is,
+
+    E[(y_t - Ax_t) (y_t - Ax_t)^T]
+      = E[y_t y_t^T -2 y_t x_t^T A^T + A x_t x_t^T A^T]
+      = E[y_t y_t^T] -2 E[y_t x_t^T] A^T + A E[x_t x_t^T] A^T
+
+    """
+    Exs = Exs if isinstance(Exs, (list, tuple)) else [Exs]
+    Eys = Eys if isinstance(Eys, (list, tuple)) else [Eys]
+    ExxTs = ExxTs if isinstance(ExxTs, (list, tuple)) else [ExxTs]
+    ExyTs = ExyTs if isinstance(ExyTs, (list, tuple)) else [ExyTs]
+    EyyTs = EyyTs if isinstance(EyyTs, (list, tuple)) else [EyyTs]
+    Ts = [len(Ex) for Ex in Exs]
+
+    if weights is None:
+        weights = [np.ones(T) for T in Ts]
+    weights = weights if isinstance(weights, (list, tuple)) else [weights]
+
+    if inputs is None:
+        inputs = [np.zeros((T,0)) for T in Ts]
+    inputs = inputs if isinstance(inputs, (list, tuple)) else [inputs]
+
+    # Extract shapes
+    D = Exs[0].shape[1]
+    N = Eys[0].shape[1]
+    M = inputs[0].shape[0]
+
+    # Construct the expectation matrices
+    xyT = np.zeros((D + M + fit_intercept, N))
+    xxT = np.zeros((D + M + fit_intercept, D + M + fit_intercept))
+    yyT = np.zeros((N, N))
+
+    for T, Ex, Ey, ExyT, ExxT, EyyT, weight, input in \
+        zip(Ts, Exs, Eys, ExyTs, ExxTs, EyyTs, weights, inputs):
+        xyT[:D] += np.sum(ExyT, axis=0)
+        xyT[D:D+M] += np.einsum('tm,td->md', input, Ey)
+        xyT[-1] += np.sum(Ey, axis=0)
+
+        xxT[:D, :D] += np.sum(ExxT, axis=0)
+        xxT[D:D+M, :D] += np.einsum('tm,td->md', input, Ex)
+        xxT[D:D+M, D:D+M] += np.einsum('tm,tn->mn', input, input)
+        xxT[-1, :D] += np.sum(Ex, axis=0)
+        xxT[-1, D:D+M] += np.sum(input, axis=0)
+        xxT[-1, -1] += T
+
+        yyT += np.sum(EyyT, axis=0)
+
+    # Copy lower block to upper
+    xxT[:D, D:D+M] = xxT[D:D+M, :D].T
+    xxT[:, -1] = xxT[-1, :].T
+
+    Ahat = np.linalg.solve(xxT, xyT)
+    A = Ahat[:D]
+    B = Ahat[D:D+M]
+    b = Ahat[-1]
+
+    # Compute the residuals
+    Q = (yyT - 2 * xyT.T @ Ahat + Ahat @ xxT @ Ahat.T) / sum(Ts)
+
+    return A, B, b, Q
 
 
 def fit_scalar_glm(Xs, ys,
@@ -434,39 +546,6 @@ def fit_multiclass_logistic_regression(X, y,
     return W
 
 
-def generalized_newton_studentst_dof(E_tau, E_logtau, nu0=1, max_iter=100, nu_min=1e-3, nu_max=20, tol=1e-8, verbose=False):
-    """
-    Generalized Newton's method for the degrees of freedom parameter, nu,
-    of a Student's t distribution.  See the notebook in the doc/students_t
-    folder for a complete derivation.
-    """
-    delbo = lambda nu: 1/2 * (1 + np.log(nu/2)) - 1/2 * digamma(nu/2) + 1/2 * E_logtau - 1/2 * E_tau
-    ddelbo = lambda nu: 1/(2 * nu) - 1/4 * polygamma(1, nu/2)
-
-    dnu = np.inf
-    nu = nu0
-    for itr in range(max_iter):
-        if abs(dnu) < tol:
-            break
-
-        if nu < nu_min or nu > nu_max:
-            warn("generalized_newton_studentst_dof fixed point grew beyond "
-                 "bounds [{},{}].".format(nu_min, nu_max))
-            nu = np.clip(nu, nu_min, nu_max)
-            break
-
-        # Perform the generalized Newton update
-        a = -nu**2 * ddelbo(nu)
-        b = delbo(nu) - a / nu
-        assert a > 0 and b < 0, "generalized_newton_studentst_dof encountered invalid values of a,b"
-        dnu = -a / b - nu
-        nu = nu + dnu
-
-    if itr == max_iter - 1:
-        warn("generalized_newton_studentst_dof failed to converge"
-             "at tolerance {} in {} iterations.".format(tol, itr))
-
-    return nu
 
 
 def fit_negative_binomial_integer_r(xs, r_min=1, r_max=20):
