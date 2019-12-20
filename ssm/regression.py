@@ -6,8 +6,8 @@ import autograd.numpy as np
 import autograd.numpy.random as npr
 from autograd.scipy.linalg import block_diag
 from autograd.scipy.special import logsumexp, gammaln
-from scipy.special import polygamma, digamma
-from scipy.optimize import minimize
+from scipy.special import polygamma, digamma, loggamma
+from scipy.optimize import minimize, minimize_scalar
 from warnings import warn
 
 mean_functions = dict(
@@ -459,9 +459,21 @@ def generalized_newton_studentst_dof(E_tau, E_logtau, nu0=1, max_iter=100, nu_mi
         # Perform the generalized Newton update
         a = -nu**2 * ddelbo(nu)
         b = delbo(nu) - a / nu
-        assert a > 0 and b < 0, "generalized_newton_studentst_dof encountered invalid values of a,b"
-        dnu = -a / b - nu
-        nu = nu + dnu
+        if a < 0 or b > 0:
+            warn("generalized_newton_studentst_dof encountered "
+                 "values of a, b. Reverting to scipy.minimize_scalar.")
+            neg_elbo = lambda nu: -1 * (0.5 * np.log(nu/2) - loggamma(nu/2) + \
+                (nu/2 - 1) * E_logtau - nu/2 * E_tau)
+            res = minimize_scalar(neg_elbo, bounds=(nu_min, nu_max), method="bounded")
+            if res.success:
+                return res.x
+            else:
+                warn("scipy.minimize scalar failed with message {}.".format(
+                    res.message))
+            break
+        else:
+            dnu = -a / b - nu
+            nu = nu + dnu
 
     if itr == max_iter - 1:
         warn("generalized_newton_studentst_dof failed to converge"
