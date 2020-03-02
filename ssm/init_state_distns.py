@@ -55,7 +55,7 @@ class FixedInitialStateDistribution(InitialStateDistribution):
             # Handle the case where user passes a numpy array of (K, 1) instead of (K,)
             pi0 = np.squeeze(np.array(pi0))
             assert len(pi0) == K, "Array passed as pi0 is of the wrong length"
-            self.log_pi0 = np.log(pi0 + 1e-16)
+            self.log_pi0 = np.log(pi0)
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
         # Don't change the distribution

@@ -141,7 +141,7 @@ class ConstrainedStationaryTransitions(StationaryTransitions):
         super(ConstrainedStationaryTransitions, self).__init__(K, D, M=M)
         Ps = self.transition_matrix
         if transition_mask is None:
-            transition_mask = np.ones_like(Ps)
+            transition_mask = np.asarray(np.ones_like(Ps), dtype=bool)
 
         # Validate the transition mask. A valid mask must have be the same shape
         # as the transition matrix, contain only ones and zeros, and contain at
@@ -153,7 +153,7 @@ class ConstrainedStationaryTransitions(StationaryTransitions):
             assert transition_mask[i].any(), "Mask must contain at least one " \
                 "nonzero entry per row."
         
-        self.transition_mask = transition_mask
+        self.transition_mask = np.asarray(transition_mask, dtype=bool)
         Ps = Ps * transition_mask
         Ps /= Ps.sum(axis=-1, keepdims=True)
         self.log_Ps = np.log(Ps)

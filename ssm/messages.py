@@ -11,6 +11,7 @@ from ssm.util import LOG_EPS, DIV_EPS
 
 to_c = lambda arr: np.copy(getval(arr), 'C') if not arr.flags['C_CONTIGUOUS'] else getval(arr)
 
+
 @numba.jit(nopython=True, cache=True)
 def logsumexp(x):
     N = x.shape[0]
@@ -54,10 +55,10 @@ def forward_pass(pi0,
     # Check if we have heterogeneous transition matrices.
     # If not, save memory by passing in log_Ps of shape (1, K, K)
     hetero = (Ps.shape[0] == T-1)
-    alphas[0] = np.log(pi0 + LOG_EPS) + log_likes[0]
+    alphas[0] = np.log(pi0) + log_likes[0]
     for t in range(T-1):
         m = np.max(alphas[t])
-        alphas[t+1] = np.log(np.dot(np.exp(alphas[t] - m), Ps[t * hetero]) + LOG_EPS) + m + log_likes[t+1]
+        alphas[t+1] = np.log(np.dot(np.exp(alphas[t] - m), Ps[t * hetero])) + m + log_likes[t+1]
     return logsumexp(alphas[T-1])
 
 
@@ -101,7 +102,7 @@ def hmm_filter(pi0, Ps, ll):
 def backward_pass(Ps,
                   log_likes,
                   betas):
-
+    errs = np.seterr(invalid='ignore') # -inf + inf
     T = log_likes.shape[0]  # number of time steps
     K = log_likes.shape[1]  # number of discrete states
 
@@ -121,8 +122,11 @@ def backward_pass(Ps,
     for t in range(T-2,-1,-1):
         tmp = log_likes[t+1] + betas[t+1]
         m = np.max(tmp)
-        betas[t] = np.log(np.dot(Ps[t * hetero], np.exp(tmp - m)) + LOG_EPS) + m
-
+        tmp_shifted = tmp - m  # Gives nan when tmp = -inf and m = -inf.
+        tmp_shifted[np.isnan(tmp_shifted)] = -np.inf
+        # this next line failes when m=-inf, because the -inf gets subtracted
+        betas[t] = np.log(np.dot(Ps[t * hetero], np.exp(tmp_shifted))) + m
+    np.seterr(**errs)
 
 
 @numba.jit(nopython=True, cache=True)
@@ -151,6 +155,7 @@ def _compute_stationary_expected_joints(alphas, betas, lls, log_P, E_zzp1):
                     maxv = tmp[i, j]
 
         # safe exponentiate
+        assert np.isfinite(maxv)
         tmpsum = 0.0
         for i in range(K):
             for j in range(K):
@@ -235,7 +240,7 @@ def backward_sample(Ps, log_likes, alphas, us, zs):
 
         # set the transition potential
         if t > 0:
-            lpzp1 = np.log(Ps[(t-1) * hetero, :, int(zs[t])] + LOG_EPS)
+            lpzp1 = np.log(Ps[(t-1) * hetero, :, int(zs[t])])
 
 
 @numba.jit(nopython=True, cache=True)
@@ -276,16 +281,17 @@ def _viterbi(pi0, Ps, ll):
     scores = np.zeros((T, K))
     args = np.zeros((T, K))
     for t in range(T-2,-1,-1):
-        vals = np.log(Ps[t * hetero] + LOG_EPS) + scores[t+1] + ll[t+1]
+        vals = np.log(Ps[t * hetero]) + scores[t+1] + ll[t+1]
         for k in range(K):
             args[t+1, k] = np.argmax(vals[k])
             scores[t, k] = np.max(vals[k])
 
     # Now maximize forwards
     z = np.zeros(T)
-    z[0] = (scores[0] + np.log(pi0 + LOG_EPS) + ll[0]).argmax()
+    z[0] = (scores[0] + np.log(pi0) + ll[0]).argmax()
     for t in range(1, T):
         z[t] = args[t, int(z[t-1])]
+        assert np.isfinite(z[t])
 
     return z
 
@@ -382,7 +388,7 @@ def _make_grad_hmm_normalizer(argnum, ans, pi0, Ps, ll):
     # Forward pass to get alphas
     alphas = np.zeros((T, K))
     forward_pass(pi0, Ps, ll, alphas)
-    grad_hmm_normalizer(np.log(Ps + LOG_EPS), alphas, dlog_pi0, dlog_Ps, dll)
+    grad_hmm_normalizer(np.log(Ps), alphas, dlog_pi0, dlog_Ps, dll)
 
     # Compute necessary gradient
     # Account for the log transformation
