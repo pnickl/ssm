@@ -69,10 +69,10 @@ def test_sample(T=10, K=4, D=3, M=2):
             zsmpl, xsmpl = hmm.sample(T, prefix=(zpre, xpre), input=npr.randn(T, M), with_noise=False)
 
 
-def test_constrained_hmm(T=100, K=3, D=3):
+def test_constrained_hmm(T=100, K=3, D=100):
     hmm = ssm.HMM(K, D, M=0, 
                   transitions="constrained",
-                  observations="gaussian")
+                  observations="Poisson")
     z, x = hmm.sample(T)
     
     transition_mask = np.array([
@@ -80,8 +80,7 @@ def test_constrained_hmm(T=100, K=3, D=3):
         [1, 0, 0],
         [1, 0, 1],
     ]).astype(bool)
-    init_Ps = np.random.rand(3, 3)
-    init_Ps /= init_Ps.sum(axis=-1, keepdims=True)
+    init_Ps = np.eye(3)
     init_log_Ps = np.log(init_Ps)
     transition_kwargs = dict(
         transition_mask=transition_mask
@@ -90,9 +89,39 @@ def test_constrained_hmm(T=100, K=3, D=3):
                   transitions="constrained",
                   observations="gaussian",
                   transition_kwargs=transition_kwargs)
-    fit_hmm.fit(x)
+    fit_hmm.transitions.log_Ps = init_log_Ps
+    fit_hmm.fit(x, initialize=False)
     learned_Ps = fit_hmm.transitions.transition_matrix
     assert np.all(learned_Ps[~transition_mask] == 0)
+
+
+def test_messages_with_hard_zeros(T=1000, K=5, D=50):
+    """Stress-test the message passing code when there are zeros in the
+    transition matrix.
+    """
+    # Make parameters
+    pi0 = np.ones(K) / K
+    Ps = np.tile(np.eye(K, K), (T-1, 1, 1))
+    ll = -1000 * npr.randn(T, K)
+    out1 = np.zeros((T, K))
+    out2 = np.zeros((T, K))
+
+    # Run the PyHSMM message passing code
+    from pyhsmm.internals.hmm_messages_interface import messages_forwards_log, messages_backwards_log
+    messages_forwards_log(Ps, ll, pi0, out1)
+
+    # Run the SSM message passing code
+    from ssm.messages import forward_pass, backward_pass
+    forward_pass(pi0, Ps, ll, out2) # Call once to compile, then time it
+    assert np.allclose(out1, out2)
+
+    # Backward pass
+    out1 = np.zeros((T, K))
+    out2 = np.zeros((T, K))
+
+    messages_backwards_log(Ps, ll, out1)
+    backward_pass(Ps, ll, out2)
+    assert np.allclose(out1, out2)
 
 
 def test_hmm_likelihood(T=1000, K=5, D=2):
@@ -308,6 +337,8 @@ def test_hmm_likelihood_perf(T=10000, K=50, D=20):
 
 
 if __name__ == "__main__":
-    # test_hmm_likelihood_perf()
-    # test_hmm_mp_perf()
+    test_hmm_likelihood_perf()
+    test_hmm_mp_perf()
     test_constrained_hmm()
+    test_messages_with_hard_zeros()
+    test_hmm_likelihood()
